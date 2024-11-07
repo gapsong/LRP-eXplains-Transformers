@@ -1,14 +1,15 @@
+import os
+import subprocess
 import matplotlib.cm as cm
 import matplotlib.colors as colors
-import os
-import torch
-import subprocess
 from pathlib import Path
 
 def _apply_colormap(relevance, cmap):
     
     colormap = cm.get_cmap(cmap)
-    return colormap(colors.Normalize(vmin=-1, vmax=1)(relevance))
+    relevance_array = relevance.numpy()
+    norm_colors = colors.Normalize(vmin=-1, vmax=1)(relevance_array)
+    return colormap(norm_colors)
 
 def _generate_latex(words, relevances, cmap="bwr"):
     """
