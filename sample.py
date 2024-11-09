@@ -8,12 +8,13 @@ from contextlib import nullcontext
 import torch
 from attnlrp_tinyllamac import ModelArgs, Transformer
 from tokenizer import Tokenizer
+from lxt.models.llama import LlamaForCausalLM, attnlrp
 
 from tinystories import get_tokenizer_model_path
 
 # -----------------------------------------------------------------------------
 checkpoint = "out/stories260K.pt"
-start = "The bird"  # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
+start = "The bird is flying"  # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 1  # number of samples to draw
 max_new_tokens = 100  # number of tokens generated in each sample
 temperature = (
@@ -60,7 +61,9 @@ for k, v in list(state_dict.items()):
         state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
 model.load_state_dict(state_dict, strict=False)
 
-model.eval()
+# model.eval()
+attnlrp.register(model)
+
 model.to(device)
 if compile:
     print("Compiling the model...")
@@ -83,12 +86,12 @@ if start.startswith("FILE:"):
     with open(start[5:], "r", encoding="utf-8") as f:
         start = f.read()
 start_ids = enc.encode(start, bos=True, eos=False)
-x = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
+token_ids = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
 
 # run generation
-with torch.no_grad():
-    with ctx:
-        for k in range(num_samples):
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            print(enc.decode(y[0].tolist()))
-            print("---------------")
+# with torch.no_grad():
+with ctx:
+    for k in range(num_samples):
+        y = model.generate(token_ids, max_new_tokens, temperature=temperature, top_k=top_k)
+        print(enc.decode(y[0].tolist()))
+        print("---------------")

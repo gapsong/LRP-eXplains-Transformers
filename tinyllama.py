@@ -61,7 +61,7 @@ Question: How high did they climb in 1922? According to the text, the 1922 exped
 input_ids = tokenizer(
     prompt, return_tensors="pt", add_special_tokens=True
 ).input_ids.to(model.device)
-input_embeds = model.get_input_embeddings()(input_ids).requires_grad_()
+input_embeds = model.get_input_embeddings()(input_ids).requires_grad_() # uses the input_ids of the tokens and creates embeddings
 print(input_embeds.requires_grad)  # Should be True
 
 output_logits = model(

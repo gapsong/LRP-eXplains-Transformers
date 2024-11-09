@@ -8,32 +8,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-
-from lxt.modules import RMSNormIdentity
-import lxt.functional as lf
-import lxt.modules as lm
-import lxt.rules as rules
 from lxt.core import Composite
 
-
-class ProjSiluMultiplication(nn.Module):
-    def forward(self, a, b):
-        return a * b
-
-
-class AttentionValueMatmul(nn.Module):
-    def forward(self, attn, value):
-        return torch.matmul(attn, value)
-
-
-attnlrp = Composite(
-    {
-        nn.SiLU: rules.IdentityRule,
-        ProjSiluMultiplication: rules.UniformRule,
-        nn.Softmax: lm.SoftmaxDT,
-        AttentionValueMatmul: rules.UniformEpsilonRule,
-    }
-)
+import lxt
+import lxt.functional as lf  # Import lxt.functional for convenience
+from lxt.modules import LinearEpsilon  # Import LinearEpsilon from lxt modules
 
 
 @dataclass
@@ -58,15 +37,23 @@ class RMSNorm(torch.nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return lf.mul2(
+            x,
+            torch.rsqrt(lf.add2(x.pow(2).mean(-1, keepdim=True), self.eps)),
+        )
 
     def forward(self, x):
         output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        return lf.mul2(output, self.weight)
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    freqs = lf.div2(
+        1.0,
+        theta ** lf.div2(
+            torch.arange(0, dim, 2)[: (dim // 2)].float(), dim
+        ),
+    )
     t = torch.arange(end, device=freqs.device)  # type: ignore
     freqs = torch.outer(t, freqs).float()  # type: ignore
     freqs_cos = torch.cos(freqs)  # real part
@@ -95,10 +82,19 @@ def apply_rotary_emb(
     freqs_sin = reshape_for_broadcast(freqs_sin, xq_r)
 
     # apply rotation using real numbers
-    xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
-    xq_out_i = xq_r * freqs_sin + xq_i * freqs_cos
-    xk_out_r = xk_r * freqs_cos - xk_i * freqs_sin
-    xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos
+    xq_r_fc = lf.mul2(xq_r, freqs_cos)
+    xq_i_fs = lf.mul2(xq_i, freqs_sin)
+    xq_out_r = lf.add2(xq_r_fc, lf.mul2(xq_i_fs, -1))
+    xq_r_fs = lf.mul2(xq_r, freqs_sin)
+    xq_i_fc = lf.mul2(xq_i, freqs_cos)
+    xq_out_i = lf.add2(xq_r_fs, xq_i_fc)
+
+    xk_r_fc = lf.mul2(xk_r, freqs_cos)
+    xk_i_fs = lf.mul2(xk_i, freqs_sin)
+    xk_out_r = lf.add2(xk_r_fc, lf.mul2(xk_i_fs, -1))
+    xk_r_fs = lf.mul2(xk_r, freqs_sin)
+    xk_i_fc = lf.mul2(xk_i, freqs_cos)
+    xk_out_i = lf.add2(xk_r_fs, xk_i_fc)
 
     # flatten last two dimensions
     xq_out = torch.stack([xq_out_r, xq_out_i], dim=-1).flatten(3)
@@ -129,18 +125,19 @@ class Attention(nn.Module):
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
-        self.wq = lm.LinearEpsilon(args.dim, args.n_heads * self.head_dim, bias=False)
-        self.wk = lm.LinearEpsilon(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = lm.LinearEpsilon(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wo = lm.LinearEpsilon(args.n_heads * self.head_dim, args.dim, bias=False)
-        # self.attn_dropout = nn.Dropout(args.dropout)
-        # self.resid_dropout = nn.Dropout(args.dropout)
-        # self.dropout = args.dropout
-        
-        self.softmax = nn.Softmax(dim=-1)
-        self.attn_value_matmul = AttentionValueMatmul()
 
-        self.flash = None
+        # Replace nn.Linear with LinearEpsilon for LRP compatibility
+        self.wq = LinearEpsilon(args.dim, args.n_heads * self.head_dim, bias=False)
+        self.wk = LinearEpsilon(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = LinearEpsilon(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wo = LinearEpsilon(args.n_heads * self.head_dim, args.dim, bias=False)
+
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+
+        # use flash attention or a manual implementation?
+        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
         if not self.flash:
             print(
                 "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0"
@@ -182,21 +179,31 @@ class Attention(nn.Module):
                 xk,
                 xv,
                 attn_mask=None,
-                dropout_p=0.0,
+                dropout_p=self.dropout if self.training else 0.0,
                 is_causal=True,
             )
         else:
-            scores = lf.mul2(lf.matmul(xq, xk.transpose(2, 3)), 1/math.sqrt(self.head_dim))
-            assert hasattr(self, 'mask')
-            scores = lf.add2(scores, self.mask[:, :, :seqlen, :seqlen])   # (bs, n_local_heads, seqlen, cache_len + seqlen)
-            scores = self.softmax(scores.float()).type_as(xq)
-            output = self.attn_value_matmul(scores, xv)
+            # manual implementation
+            scores = lf.div2(
+                lf.matmul(xq, xk.transpose(2, 3)),
+                math.sqrt(self.head_dim),
+            )
+            assert hasattr(self, "mask")
+            scores = lf.add2(
+                scores, self.mask[:, :, :seqlen, :seqlen]
+            )  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            scores = lf.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = lf.matmul(
+                scores, xv
+            )  # (bs, n_local_heads, seqlen, head_dim)
 
         # restore time as batch dimension and concat heads
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
 
         # final projection into the residual stream
         output = self.wo(output)
+        output = self.resid_dropout(output)
         return output
 
 
@@ -204,18 +211,23 @@ class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int, multiple_of: int, dropout: float):
         super().__init__()
         if hidden_dim is None:
-            hidden_dim = 4 * dim
-            hidden_dim = int(2 * hidden_dim / 3)
-            hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-        self.w1 = lm.LinearEpsilon(dim, hidden_dim, bias=False)  # gate proj
-        self.w2 = lm.LinearEpsilon(hidden_dim, dim, bias=False)  # up proj
-        self.w3 = lm.LinearEpsilon(dim, hidden_dim, bias=False)  # down proj
-        # self.dropout = nn.Dropout(dropout)
-        self.silu = nn.SiLU(inplace=False)
-        self.proj_silu_mul = ProjSiluMultiplication()
+            hidden_dim = lf.mul2(4, dim)
+            hidden_dim = lf.div2(
+                lf.mul2(2, hidden_dim), 3
+            ).to(int)
+            hidden_dim = multiple_of * (
+                (hidden_dim + multiple_of - 1) // multiple_of
+            )
+        # Replace nn.Linear with LinearEpsilon
+        self.w1 = LinearEpsilon(dim, hidden_dim, bias=False)
+        self.w2 = LinearEpsilon(hidden_dim, dim, bias=False)
+        self.w3 = LinearEpsilon(dim, hidden_dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.w2(self.proj_silu_mul(self.silu(self.w1(x)), self.w3(x)))
+        return self.dropout(
+            self.w2(lf.mul2(F.silu(self.w1(x)), self.w3(x)))
+        )
 
 
 class TransformerBlock(nn.Module):
@@ -232,35 +244,38 @@ class TransformerBlock(nn.Module):
             dropout=args.dropout,
         )
         self.layer_id = layer_id
-        self.attention_norm = RMSNormIdentity(args.dim, eps=args.norm_eps)
-        self.ffn_norm = RMSNormIdentity(args.dim, eps=args.norm_eps)
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
     def forward(self, x, freqs_cos, freqs_sin):
-        hidden_states = self.attention_norm(x)
-        attention =  self.attention.forward(hidden_states, freqs_cos, freqs_sin)
         h = lf.add2(
-            x, attention
+            x,
+            self.attention.forward(self.attention_norm(x), freqs_cos, freqs_sin),
         )
-        out = lf.add2(h, self.feed_forward.forward(self.ffn_norm(h)))
+        out = lf.add2(
+            h, self.feed_forward.forward(self.ffn_norm(h))
+        )
         return out
+
 
 class Transformer(nn.Module):
     last_loss: Optional[torch.Tensor]
 
     def __init__(self, params: ModelArgs):
         super().__init__()
-
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
+        # Replace nn.Embedding with lxt's equivalent if necessary
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
-        
+        self.dropout = nn.Dropout(params.dropout)
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
-        self.norm = RMSNormIdentity(params.dim, eps=params.norm_eps)
-        self.output = lm.LinearEpsilon(params.dim, params.vocab_size, bias=False)
+        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+        # Replace nn.Linear with LinearEpsilon
+        self.output = LinearEpsilon(params.dim, params.vocab_size, bias=False)
 
         # share the unembedding parameters with the embedding parameters
         self.tok_embeddings.weight = (
@@ -269,7 +284,8 @@ class Transformer(nn.Module):
 
         # some useful precompute for the RoPE relative positional embeddings
         freqs_cos, freqs_sin = precompute_freqs_cis(
-            self.params.dim // self.params.n_heads, self.params.max_seq_len
+            lf.div2(self.params.dim, self.params.n_heads).to(int),
+            self.params.max_seq_len,
         )
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
@@ -286,11 +302,8 @@ class Transformer(nn.Module):
         # Initialize attribute for the loss of the last forward call. This will be set if the forward is called with a targets tensor.
         self.last_loss = None
 
-    def _get_input_embeddings(self):
-        return self.tok_embeddings
-
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
+        if isinstance(module, LinearEpsilon):  # Update to check for LinearEpsilon
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -300,12 +313,12 @@ class Transformer(nn.Module):
     def forward(
         self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        _bsz, seqlen, dim = tokens.shape
-        h = tokens
+        _bsz, seqlen = tokens.shape
+        h = self.tok_embeddings(tokens)
+        h = self.dropout(h)
         freqs_cos = self.freqs_cos[:seqlen]
         freqs_sin = self.freqs_sin[:seqlen]
 
-        print(self.layers)
         for layer in self.layers:
             h = layer(h, freqs_cos, freqs_sin)
         h = self.norm(h)
@@ -363,19 +376,23 @@ class Transformer(nn.Module):
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = sum(p.numel() for p in self.parameters())
         cfg = self.params
-        L, H, Q, T = cfg.n_layers, cfg.n_heads, cfg.dim // cfg.n_heads, cfg.max_seq_len
-        flops_per_token = 6 * N + 12 * L * H * Q * T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+        L = cfg.n_layers
+        H = cfg.n_heads
+        Q = lf.div2(cfg.dim, cfg.n_heads).to(int)
+        T = cfg.max_seq_len
+        flops_per_token = lf.add2(
+            lf.mul2(6, N), lf.mul2(12, L * H * Q * T)
+        )
+        flops_per_fwdbwd = lf.mul2(flops_per_token, T)
+        flops_per_iter = lf.mul2(flops_per_fwdbwd, fwdbwd_per_iter)
         # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0 / dt)  # per second
+        flops_achieved = lf.mul2(flops_per_iter, (1.0 / dt))  # per second
         flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
+        mfu = lf.div2(flops_achieved, flops_promised)
         return mfu
 
-    def generate(
-        self, idx, max_new_tokens, temperature=1.0, top_k=None, return_probs=False
-    ):
+    @torch.inference_mode()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -390,43 +407,22 @@ class Transformer(nn.Module):
                 else idx[:, -self.params.max_seq_len :]
             )
             # forward the model to get the logits for the index in the sequence
-
-            # t0 = time.perf_counter_ns()
-            # Input type = [1, 412, 323]
-            input_embeds = self.tok_embeddings(idx_cond)
-            input_embeds.requires_grad_()
-            logits = self(input_embeds)
-            # t1 = time.perf_counter_ns() - t0
-            # print(f"inference: {t1}s")
-
+            logits = self(idx_cond)
             logits = logits[:, -1, :]  # crop to just the final time step
             if temperature == 0.0:
                 # "sample" the single most likely index
                 _, idx_next = torch.topk(logits, k=1, dim=-1)
             else:
                 # pluck the logits at the final step and scale by desired temperature
-                logits = logits / temperature
+                logits = lf.div2(logits, temperature)
                 # optionally crop the logits to only the top k options
                 if top_k is not None:
                     v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                     logits[logits < v[:, [-1]]] = -float("Inf")
                 # apply softmax to convert logits to (normalized) probabilities
-                logits_wo_special_chars = logits[:, -2:]
                 probs = F.softmax(logits, dim=-1)
-                probs_wo_spec = F.softmax(logits_wo_special_chars, dim=-1)
                 idx_next = torch.multinomial(probs, num_samples=1)
-                
-                max_logits, max_indices = torch.max(logits, dim=-1)
-                max_logits.backward(max_logits)
-                relevance = input_embeds.grad.float().sum(-1).cpu()[0]
-                # normalize relevance between [-1, 1] for plotting
-                relevance = relevance / relevance.abs().max()
-
-                
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
-        if return_probs:
-            return idx, probs_wo_spec
-        else:
-            return idx
+        return idx
