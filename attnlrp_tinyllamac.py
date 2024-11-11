@@ -51,20 +51,6 @@ class ModelArgs:
     dropout: float = 0.0
 
 
-class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x):
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
-
-
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
@@ -94,11 +80,10 @@ def apply_rotary_emb(
     freqs_cos = reshape_for_broadcast(freqs_cos, xq_r)
     freqs_sin = reshape_for_broadcast(freqs_sin, xq_r)
 
-    # apply rotation using real numbers
-    xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
-    xq_out_i = xq_r * freqs_sin + xq_i * freqs_cos
-    xk_out_r = xk_r * freqs_cos - xk_i * freqs_sin
-    xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos
+    xq_out_r = lf.add2(lf.mul2(xq_r, freqs_cos.detach()), -lf.mul2(xq_i, freqs_sin.detach()))
+    xq_out_i = lf.add2(lf.mul2(xq_r, freqs_sin.detach()), lf.mul2(xq_i, freqs_cos.detach()))
+    xk_out_r = lf.add2(lf.mul2(xk_r, freqs_cos.detach()), -lf.mul2(xk_i, freqs_sin.detach()))
+    xk_out_i = lf.add2(lf.mul2(xk_r, freqs_sin.detach()), lf.mul2(xk_i, freqs_cos.detach()))
 
     # flatten last two dimensions
     xq_out = torch.stack([xq_out_r, xq_out_i], dim=-1).flatten(3)
@@ -130,13 +115,14 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
         self.wq = lm.LinearEpsilon(args.dim, args.n_heads * self.head_dim, bias=False)
-        self.wk = lm.LinearEpsilon(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = lm.LinearEpsilon(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wk = lm.LinearEpsilon(
+            args.dim, self.n_kv_heads * self.head_dim, bias=False
+        )
+        self.wv = lm.LinearEpsilon(
+            args.dim, self.n_kv_heads * self.head_dim, bias=False
+        )
         self.wo = lm.LinearEpsilon(args.n_heads * self.head_dim, args.dim, bias=False)
-        # self.attn_dropout = nn.Dropout(args.dropout)
-        # self.resid_dropout = nn.Dropout(args.dropout)
-        # self.dropout = args.dropout
-        
+
         self.softmax = nn.Softmax(dim=-1)
         self.attn_value_matmul = AttentionValueMatmul()
 
@@ -186,9 +172,13 @@ class Attention(nn.Module):
                 is_causal=True,
             )
         else:
-            scores = lf.mul2(lf.matmul(xq, xk.transpose(2, 3)), 1/math.sqrt(self.head_dim))
-            assert hasattr(self, 'mask')
-            scores = lf.add2(scores, self.mask[:, :, :seqlen, :seqlen])   # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            scores = lf.mul2(
+                lf.matmul(xq, xk.transpose(2, 3)), 1 / math.sqrt(self.head_dim)
+            )
+            assert hasattr(self, "mask")
+            scores = lf.add2(
+                scores, self.mask[:, :, :seqlen, :seqlen]
+            )  # (bs, n_local_heads, seqlen, cache_len + seqlen)
             scores = self.softmax(scores.float()).type_as(xq)
             output = self.attn_value_matmul(scores, xv)
 
@@ -237,12 +227,11 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x, freqs_cos, freqs_sin):
         hidden_states = self.attention_norm(x)
-        attention =  self.attention.forward(hidden_states, freqs_cos, freqs_sin)
-        h = lf.add2(
-            x, attention
-        )
+        attention = self.attention.forward(hidden_states, freqs_cos, freqs_sin)
+        h = lf.add2(x, attention)
         out = lf.add2(h, self.feed_forward.forward(self.ffn_norm(h)))
         return out
+
 
 class Transformer(nn.Module):
     last_loss: Optional[torch.Tensor]
@@ -255,7 +244,7 @@ class Transformer(nn.Module):
         self.n_layers = params.n_layers
 
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
-        
+
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
@@ -374,8 +363,7 @@ class Transformer(nn.Module):
         return mfu
 
     def generate(
-        self, idx, max_new_tokens, temperature=1.0, top_k=None, return_probs=False
-    ):
+        self, idx, max_new_tokens, temperature=1.0, top_k=None, return_probs=False, relevance_state=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -387,7 +375,7 @@ class Transformer(nn.Module):
             idx_cond = (
                 idx
                 if idx.size(1) <= self.params.max_seq_len
-                else idx[:, -self.params.max_seq_len :]
+                else idx[:, -self.params.max_seq_len:]
             )
             # forward the model to get the logits for the index in the sequence
 
@@ -415,14 +403,11 @@ class Transformer(nn.Module):
                 probs = F.softmax(logits, dim=-1)
                 probs_wo_spec = F.softmax(logits_wo_special_chars, dim=-1)
                 idx_next = torch.multinomial(probs, num_samples=1)
-                
                 max_logits, max_indices = torch.max(logits, dim=-1)
                 max_logits.backward(max_logits)
-                relevance = input_embeds.grad.float().sum(-1).cpu()[0]
                 # normalize relevance between [-1, 1] for plotting
                 relevance = relevance / relevance.abs().max()
 
-                
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 

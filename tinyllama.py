@@ -16,7 +16,8 @@ model = LlamaForCausalLM.from_pretrained(
 
 tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
-model.gradient_checkpointing_enable()  # apply AttnLRP rules
+model.gradient_checkpointing_enable()
+# apply AttnLRP rules
 attnlrp.register(model)
 
 
@@ -61,7 +62,9 @@ Question: How high did they climb in 1922? According to the text, the 1922 exped
 input_ids = tokenizer(
     prompt, return_tensors="pt", add_special_tokens=True
 ).input_ids.to(model.device)
-input_embeds = model.get_input_embeddings()(input_ids).requires_grad_() # uses the input_ids of the tokens and creates embeddings
+input_embeds = model.get_input_embeddings()(
+    input_ids
+).requires_grad_()  # uses the input_ids of the tokens and creates embeddings
 print(input_embeds.requires_grad)  # Should be True
 
 output_logits = model(
@@ -73,6 +76,7 @@ max_logits, max_indices = torch.max(output_logits[0, -1, :], dim=-1)
 max_logits.backward(max_logits)
 
 relevance = input_embeds.grad.float().sum(-1).cpu()[0]
+relevance_sum = sum(relevance)
 # normalize relevance between [-1, 1] for plotting
 relevance = relevance / relevance.abs().max()
 

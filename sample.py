@@ -2,13 +2,13 @@
 Sample from the trained model with PyTorch
 """
 
-import os
-import pickle
-from contextlib import nullcontext
 import torch
+import numpy as np
+from contextlib import nullcontext
+from collections import OrderedDict
 from attnlrp_tinyllamac import ModelArgs, Transformer
 from tokenizer import Tokenizer
-from lxt.models.llama import LlamaForCausalLM, attnlrp
+from lxt.models.llama import attnlrp
 
 from tinystories import get_tokenizer_model_path
 
@@ -59,10 +59,40 @@ unwanted_prefix = "_orig_mod."
 for k, v in list(state_dict.items()):
     if k.startswith(unwanted_prefix):
         state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
+
 model.load_state_dict(state_dict, strict=False)
 
-# model.eval()
+# apply AttnLRP rules
 attnlrp.register(model)
+
+
+# Initialize relevance_state to store relevances
+relevance_state = OrderedDict()
+
+
+def hidden_relevance_hook(module, input, output):
+    if isinstance(output, tuple):
+        output = output[0]
+    relevance = output.detach().cpu().float().numpy()  # Convert to NumPy array
+    for name, param in model.named_modules():
+        if param is module:
+            relevance_state[name] = relevance
+            print(f"Relevance saved for {name}: shape = {relevance.shape}")
+            break
+
+
+# Apply the hook only to leaf modules
+def apply_hooks_to_leaf_modules(module):
+    if len(list(module.children())) == 0:
+        module.register_full_backward_hook(hidden_relevance_hook)
+        print(f"Hook registered on leaf module: {module}")
+    else:
+        for child in module.children():
+            apply_hooks_to_leaf_modules(child)
+
+
+# Apply hooks to all leaf modules in the model
+apply_hooks_to_leaf_modules(model)
 
 model.to(device)
 if compile:
@@ -92,6 +122,16 @@ token_ids = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
 # with torch.no_grad():
 with ctx:
     for k in range(num_samples):
-        y = model.generate(token_ids, max_new_tokens, temperature=temperature, top_k=top_k)
+        y = model.generate(
+            token_ids,
+            max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            relevance_state=relevance_state,
+        )
         print(enc.decode(y[0].tolist()))
+        np.savez_compressed("relevance_state.npz", **relevance_state)
+
+        print("All relevances saved to relevance_state.npz")
+
         print("---------------")
