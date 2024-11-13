@@ -76,7 +76,14 @@ def hidden_relevance_hook(module, input, output):
     relevance = output.detach().cpu().float().numpy()  # Convert to NumPy array
     for name, param in model.named_modules():
         if param is module:
-            relevance_state[name] = relevance
+            relevance_state[name] = {
+                "relevance": relevance,
+                "min": relevance[0].min(),
+                "max": relevance[0].max(),
+                "sum": relevance[0].sum(),
+            }
+            print(relevance[0])
+            # Add relevances per layer and save them in the relevance_state
             print(f"Relevance saved for {name}: shape = {relevance.shape}")
             break
 

@@ -405,6 +405,8 @@ class Transformer(nn.Module):
                 idx_next = torch.multinomial(probs, num_samples=1)
                 max_logits, max_indices = torch.max(logits, dim=-1)
                 max_logits.backward(max_logits)
+                relevance = input_embeds.grad.float().sum(-1).cpu()[0]
+
                 # normalize relevance between [-1, 1] for plotting
                 relevance = relevance / relevance.abs().max()
 

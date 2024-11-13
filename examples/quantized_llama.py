@@ -5,7 +5,8 @@ from transformers import BitsAndBytesConfig
 from lxt.models.llama import LlamaForCausalLM, attnlrp
 from lxt.utils import pdf_heatmap, clean_tokens
 
-path = "meta-llama/Llama-3.1-8B-Instruct"
+path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+
 
 # optional 4bit quantization to reduce memory footprint
 quantization_config = BitsAndBytesConfig(

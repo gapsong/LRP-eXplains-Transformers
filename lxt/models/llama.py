@@ -24,6 +24,7 @@ import math
 from typing import List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 
@@ -74,8 +75,7 @@ from bitsandbytes.nn import Linear4bit, Linear8bitLt
 class ProjSiluMultiplication(nn.Module):
     def forward(self, a, b):
         return a * b
-
-
+    
 class AttentionValueMatmul(nn.Module):
     def forward(self, attn, value):
         return torch.matmul(attn, value)
@@ -291,9 +291,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
@@ -354,15 +352,9 @@ class LlamaAttention(nn.Module):
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(
-            bsz, q_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        key_states = key_states.view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)
-        value_states = value_states.view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         if position_embeddings is None:
             logger.warning_once(
@@ -432,12 +424,8 @@ class LlamaDecoderLayer(nn.Module):
         self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config)
-        self.input_layernorm = RMSNormIdentity(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_attention_layernorm = RMSNormIdentity(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = RMSNormIdentity(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNormIdentity(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -538,7 +526,7 @@ class LlamaPreTrainedModel(PreTrainedModel):
     _no_split_modules = ["LlamaDecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn_2 = True
-    _supports_sdpa = True
+    _supports_sdpa = False
     _supports_cache_class = True
     _supports_quantized_cache = True
     _supports_static_cache = True
@@ -678,15 +666,9 @@ class LlamaModel(LlamaPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
-        output_attentions = (
-            output_attentions
-            if output_attentions is not None
-            else self.config.output_attentions
-        )
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else self.config.output_hidden_states
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -786,11 +768,7 @@ class LlamaModel(LlamaPreTrainedModel):
             next_cache = next_cache.to_legacy_cache()
 
         if not return_dict:
-            return tuple(
-                v
-                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns]
-                if v is not None
-            )
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
@@ -951,7 +929,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         return self.model
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=CausalLMOutput, config_class=_CONFIG_FOR_DOC)
+    @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1000,13 +978,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         ```"""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else self.config.output_hidden_states
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
-        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
@@ -1040,6 +1014,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
+            past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
@@ -1096,9 +1071,7 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
             config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
             `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
         """
-        return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
-        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         transformer_outputs = self.model(
             input_ids,
@@ -1120,9 +1093,7 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
             batch_size = inputs_embeds.shape[0]
 
         if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError(
-                "Cannot handle batch sizes > 1 if no padding token is defined."
-            )
+            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
         if self.config.pad_token_id is None:
             sequence_lengths = -1
         else:
@@ -1134,9 +1105,7 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
             else:
                 sequence_lengths = -1
 
-        pooled_logits = logits[
-            torch.arange(batch_size, device=logits.device), sequence_lengths
-        ]
+        pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
 
         loss = None
         if labels is not None:
