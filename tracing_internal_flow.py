@@ -9,7 +9,7 @@ def save_heatmap(values, tokens, figsize, title, save_path):
     fig, ax = plt.subplots(figsize=figsize)
 
     abs_max = abs(values).max()
-    im = ax.imshow(values, cmap='bwr', vmin=-abs_max, vmax=abs_max)
+    im = ax.imshow(values, cmap="bwr", vmin=-abs_max, vmax=abs_max)
 
     layers = np.arange(values.shape[-1])
 
@@ -23,13 +23,13 @@ def save_heatmap(values, tokens, figsize, title, save_path):
     ax.set_yticklabels(tokens)
 
     plt.title(title)
-    plt.xlabel('Layers')
-    plt.ylabel('Tokens')
+    plt.xlabel("Layers")
+    plt.ylabel("Tokens")
     plt.colorbar(im)
 
     plt.show()
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
 
 
 def hidden_relevance_hook(module, input, output):
@@ -43,7 +43,9 @@ def hidden_relevance_hook(module, input, output):
     for name, param in model.named_modules():
         if param is module:
             if name not in relevance_state.keys():
-                relevance_state[name] = module # {"relevance": relevance, "min": relevance[0].min(), "max": relevance[0].max(), "sum": relevance[0].sum()}
+                relevance_state[name] = (
+                    module  # {"relevance": relevance, "min": relevance[0].min(), "max": relevance[0].max(), "sum": relevance[0].sum()}
+                )
             break
 
 
@@ -58,20 +60,21 @@ def apply_hooks_to_leaf_modules(module):
 
 
 relevance_state = {}
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 cache_dir = "/home/nico/projects/llm_x_subspaces/models"
 read_token_huggingface = "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"
 
 if not torch.cuda.is_available():
     cache_dir = "/Users/harder/PycharmProjects/llm_x_subspaces/models"
 
-model = LlamaForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-                                         token=read_token_huggingface,
-                                         torch_dtype=torch.bfloat16,
-                                         device_map=device)
+model = LlamaForCausalLM.from_pretrained(
+    "Felladrin/Llama-160M-Chat-v1",
+    torch_dtype=torch.bfloat16,
+    device_map=device,
+)
 
-tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0", token=read_token_huggingface)
-
+tokenizer = AutoTokenizer.from_pretrained("Felladrin/Llama-160M-Chat-v1")
+tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 model.eval()
 attnlrp.register(model)
 
@@ -84,10 +87,14 @@ for layer in model.model.layers:
 
 prompt_response = f"<s>The richest person in the world is"
 
-input_ids = tokenizer(prompt_response, return_tensors="pt", add_special_tokens=False).input_ids.to(model.device)
+input_ids = tokenizer(
+    prompt_response, padding=True, truncation=True,  return_tensors="pt", add_special_tokens=False
+).input_ids.to(model.device)
 input_embeds = model.get_input_embeddings()(input_ids)
 
-output_logits = model(inputs_embeds=input_embeds.requires_grad_(), use_cache=False).logits
+output_logits = model(
+    inputs_embeds=input_embeds.requires_grad_(), use_cache=False
+).logits
 max_logits, max_indices = torch.max(output_logits[:, -1, :], dim=-1)
 max_logits.backward(max_logits)
 
@@ -103,14 +110,22 @@ for layer in model.model.layers:
 relevance_trace = torch.stack(relevance_trace)
 float_relevance_trace = relevance_trace.float().numpy().T
 tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
-save_heatmap(float_relevance_trace, tokens, (10, 7), f"Latent Relevance Trace (Normalized)",
-             f'latent_rel_trace.png')
+
+save_heatmap(
+    float_relevance_trace,
+    tokens,
+    (10, 7),
+    f"Latent Relevance Trace (Normalized)",
+    f"latent_rel_trace.png",
+)
 
 num_tokens = 15
 predicted_tokens = []
 
 for _ in range(num_tokens):
-    output_logits = model(inputs_embeds=input_embeds.requires_grad_(), use_cache=False).logits
+    output_logits = model(
+        inputs_embeds=input_embeds.requires_grad_(), use_cache=False
+    ).logits
     max_logits, max_indices = torch.max(output_logits[:, -1, :], dim=-1)
     predicted_tokens.append(max_indices.item())
     input_ids = torch.cat([input_ids, max_indices.unsqueeze(0)], dim=1)
